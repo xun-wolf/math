@@ -1,0 +1,333 @@
+// Prisma schema · SQLite
+// 覆盖 PLAN.md §4 数据模型。M1 只使用 User / Session / LoginAudit，
+// 其他表提前建好避免后续迁移破坏 dev.db。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── 4.1 用户与组织 ────────────────────────────────────
+
+model User {
+  id                 String    @id @default(cuid())
+  loginName          String    @unique
+  name               String
+  passwordHash       String
+  role               String    // TEACHER | STUDENT | RESEARCHER
+  mustChangePassword Boolean   @default(false)
+  failedAttempts     Int         @default(0)
+  lockedUntil        DateTime?
+  lastLoginAt        DateTime?
+  createdAt          DateTime    @default(now())
+
+  sessions           Session[]
+  managedClasses     ClassRoom[]     @relation("ClassTeacher")
+  enrollments        ClassEnrollment[]
+  createdAssignments Assignment[]    @relation("AssignmentCreator")
+  gradings           Grading[]       @relation("GradingTeacher")
+  publishedReviews   PublishedReview[] @relation("ReviewPublisher")
+  auditLogs          AuditLog[]
+  repliedQuestions   StudentQuestion[] @relation("TeacherReplier")
+  resolvedCorrections Correction[]    @relation("TeacherResolver")
+}
+
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model LoginAudit {
+  id        String   @id @default(cuid())
+  loginName String
+  ok        Boolean
+  ip        String?
+  ua        String?
+  reason    String?
+  at        DateTime @default(now())
+
+  @@index([loginName, at])
+}
+
+model ClassRoom {
+  id        String   @id @default(cuid())
+  name      String
+  teacherId String
+  teacher   User     @relation("ClassTeacher", fields: [teacherId], references: [id])
+  createdAt DateTime @default(now())
+
+  enrollments ClassEnrollment[]
+  assignments Assignment[]
+}
+
+model ClassEnrollment {
+  classId   String
+  studentId String
+  joinedAt  DateTime @default(now())
+  class     ClassRoom @relation(fields: [classId], references: [id], onDelete: Cascade)
+  student   User      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@id([classId, studentId])
+}
+
+// ─── 4.2 教学内容 ──────────────────────────────────────
+
+model KnowledgePoint {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  name        String
+  parentId    String?
+  parent      KnowledgePoint?  @relation("KPTree", fields: [parentId], references: [id])
+  children    KnowledgePoint[] @relation("KPTree")
+  description String?
+  subject     String   @default("math")
+  createdAt   DateTime @default(now())
+
+  questions QuestionKnowledgePoint[]
+  stats     ErrorStat[]
+  drafts    ReviewDraftKnowledge[]
+}
+
+model Assignment {
+  id        String   @id @default(cuid())
+  classId   String
+  class     ClassRoom @relation(fields: [classId], references: [id])
+  title     String
+  dueDate   DateTime?
+  createdBy String
+  creator   User     @relation("AssignmentCreator", fields: [createdBy], references: [id])
+  status    String   @default("OPEN") // OPEN | CLOSED
+  createdAt DateTime @default(now())
+
+  questions Question[]
+  stats     ErrorStat[]
+  drafts    ReviewDraft[]
+}
+
+model Question {
+  id           String   @id @default(cuid())
+  assignmentId String
+  assignment   Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  seq          Int
+  stemText     String
+  difficulty   Int      @default(3)
+  sourceNote   String?
+
+  standardAnswer StandardAnswer?
+  knowledge      QuestionKnowledgePoint[]
+  submissions    Submission[]
+  stats          ErrorStat[]
+  drafts         ReviewDraft[]
+
+  @@unique([assignmentId, seq])
+}
+
+model QuestionKnowledgePoint {
+  questionId String
+  kpId       String
+  question   Question      @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  kp         KnowledgePoint @relation(fields: [kpId], references: [id])
+
+  @@id([questionId, kpId])
+}
+
+model StandardAnswer {
+  id               String   @id @default(cuid())
+  questionId       String   @unique
+  question         Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  answerText       String
+  rubricText       String
+  commonMistakeNote String?
+  updatedAt        DateTime @default(now())
+}
+
+// ─── 4.3 答题与批改 ────────────────────────────────────
+
+model Submission {
+  id           String   @id @default(cuid())
+  questionId   String
+  question     Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  studentId    String
+  answerText   String
+  submittedAt  DateTime @default(now())
+
+  grading    Grading?
+  correction Correction[]
+
+  @@unique([questionId, studentId])
+}
+
+model Grading {
+  id            String   @id @default(cuid())
+  submissionId  String   @unique
+  submission    Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  score         Float
+  verdict       String   // CORRECT | WRONG | PARTIAL
+  teacherNote   String?
+  teacherId     String
+  teacher       User     @relation("GradingTeacher", fields: [teacherId], references: [id])
+  gradedAt      DateTime @default(now())
+}
+
+// ─── 4.4 统计（派生） ──────────────────────────────────
+
+model ErrorStat {
+  id              String   @id @default(cuid())
+  assignmentId    String
+  assignment      Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  knowledgePointId String?
+  kp              KnowledgePoint? @relation(fields: [knowledgePointId], references: [id])
+  total           Int
+  wrongCount      Int
+  partialCount    Int
+  correctCount    Int
+  updatedAt       DateTime @default(now())
+
+  @@unique([questionId, knowledgePointId])
+}
+
+// ─── 4.5 AI 草稿 ───────────────────────────────────────
+
+model ReviewDraft {
+  id                     String   @id @default(cuid())
+  questionId             String
+  question               Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  assignmentId           String
+  assignment             Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  status                 String   @default("DRAFT") // DRAFT | NEEDS_MANUAL | APPROVED | PUBLISHED | REJECTED
+  source                 String   @default("AI")    // AI | MANUAL
+  modelTag               String?
+  aiFailReason           String?  // NEEDS_MANUAL 的原因：缺依据说明 或 provider 抛错原文（供排查，不对学生展示）
+  currentVersion         Int      @default(1)
+
+  // 结构化正文：AI 输出解析后分字段存；SQLite 无 JSON 类型，errorCauses 存 JSON 字符串
+  summary                String?
+  errorCauses            String?  // JSON: [{cause, count, evidence}]
+  explanation            String?
+  workedExample          String?
+
+  // 生成时依据快照（只读，防后续改动导致依据漂移）
+  basedOnQuestionSnapshot   String
+  basedOnAnswerSnapshot     String?
+  basedOnErrorSummary       String
+
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @default(now())
+
+  knowledge   ReviewDraftKnowledge[]
+  suggestions PracticeSuggestion[]
+  versions    ReviewDraftVersion[]
+  published   PublishedReview?
+
+  @@index([assignmentId, status])
+}
+
+// 每次 AI 生成 / 重新生成 / 人工修改 / 回退都留一个快照，支持查看历史与恢复
+model ReviewDraftVersion {
+  id              String   @id @default(cuid())
+  draftId         String
+  draft           ReviewDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  versionNum      Int
+  contentSnapshot String   // JSON: {summary, errorCauses, explanation, workedExample, knowledgePointIds, practiceSuggestions}
+  changeType      String   // AI_GENERATED | REGENERATED | MANUAL_EDIT | RESTORED
+  createdBy       String
+  createdAt       DateTime @default(now())
+
+  @@unique([draftId, versionNum])
+  @@index([draftId])
+}
+
+model ReviewDraftKnowledge {
+  draftId String
+  kpId    String
+  draft   ReviewDraft    @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  kp      KnowledgePoint @relation(fields: [kpId], references: [id])
+
+  @@id([draftId, kpId])
+}
+
+model PracticeSuggestion {
+  id             String   @id @default(cuid())
+  draftId        String
+  draft          ReviewDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  questionRefText String
+  rationale      String?
+  chosen         Boolean  @default(false)
+}
+
+// ─── 4.6 正式发布与学生反馈 ────────────────────────────
+
+model PublishedReview {
+  id            String   @id @default(cuid())
+  draftId       String   @unique
+  draft         ReviewDraft @relation(fields: [draftId], references: [id])
+  classId       String
+  finalContent  String
+  publishedBy   String
+  publisher     User     @relation("ReviewPublisher", fields: [publishedBy], references: [id])
+  publishedAt   DateTime @default(now())
+
+  corrections Correction[]
+  questions   StudentQuestion[]
+}
+
+model Correction {
+  id                String   @id @default(cuid())
+  publishedReviewId String
+  review            PublishedReview @relation(fields: [publishedReviewId], references: [id], onDelete: Cascade)
+  studentId         String
+  submissionId      String?
+  submission        Submission? @relation(fields: [submissionId], references: [id])
+  correctedAnswerText String
+  status            String   @default("PENDING") // PENDING | RESOLVED | STILL_WRONG
+  teacherResolvedNote String?
+  resolvedBy        String?
+  resolver          User?    @relation("TeacherResolver", fields: [resolvedBy], references: [id])
+  updatedAt         DateTime @default(now())
+
+  @@unique([publishedReviewId, studentId])
+}
+
+model StudentQuestion {
+  id                String   @id @default(cuid())
+  publishedReviewId String
+  review            PublishedReview @relation(fields: [publishedReviewId], references: [id], onDelete: Cascade)
+  studentId         String
+  questionText      String
+  teacherReply      String?
+  repliedBy         String?
+  replier           User?    @relation("TeacherReplier", fields: [repliedBy], references: [id])
+  createdAt         DateTime @default(now())
+  repliedAt         DateTime?
+}
+
+// ─── 4.7 审计 ──────────────────────────────────────────
+
+model AuditLog {
+  id       String   @id @default(cuid())
+  actorId  String?
+  actor    User?    @relation(fields: [actorId], references: [id])
+  action   String
+  entity   String
+  entityId String
+  before   String?
+  after    String?
+  at       DateTime @default(now())
+
+  @@index([entity, entityId])
+}
