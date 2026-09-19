@@ -57,6 +57,9 @@ export default async function Stats({ params }: { params: { id: string } }) {
         <Link href={`/teacher/assignments/${assignment.id}/import-grading`} className="text-brand-500 hover:underline">
           导入批改
         </Link>
+        <Link href={`/teacher/assignments/${assignment.id}/roster`} className="text-brand-500 hover:underline">
+          错题名单
+        </Link>
         <Link href={`/teacher/assignments/${assignment.id}/corrections`} className="text-brand-500 hover:underline">
           订正跟踪
         </Link>
