@@ -22,6 +22,8 @@
 | v1.0 | - | 初版草案 |
 | v2.0 | 2026-09-18 | 结构重组；AI 草稿结构化存储与版本历史；CSV 导入校验预览；订正辅助校验；补充边界场景与状态流转；增加优先级标注 |
 | v2.1 | 2026-09-18 | 与 M1/M2 实现对齐：跨班越权统一返回 **404**（防枚举，原写 403）；教师可把预置学生加入/移出本班；知识点**保留树结构**（扁平为其特例，不删代码） |
+| v2.2 | 2026-09-19 | 统一知识点为树（§5.1/§7/§12 对齐）；补 CSV 模板格式规格表与手工录入路径；补 ErrorStat 按知识点生成逻辑；补撤回已发布讲评的状态流转与边界；补学生端空状态；seed 给 teacher01 加第 2 个班；补 AI Mock 生成规则伪代码；补 F12 触发时机与失败兜底；补演示说明章节（§13）与目录结构章节（§14）；修验收场景 #6 对应模块 F6→F8 |
+| v2.3 | 2026-09-19 | CSV 导入改为前端 PapaParse 直接解析 + 页面渲染表格预览（错误行红色高亮）；移除 preview API 端点；技术选型加 PapaParse；补前后端职责分工表 |
 
 ---
 
@@ -259,8 +261,8 @@
 | # | 模块 | 优先级 | 说明 |
 |---|---|---|---|
 | F1 | 认证与权限 | P0 | 登录、会话、角色守卫、越权防护 |
-| F2 | 班级与学生管理 | P0 | 建班、学生列表、班级归属校验 |
-| F3 | 知识点管理 | P0 | 知识点 CRUD（首版扁平列表） |
+| F2 | 班级与学生管理 | P0 | 建班、学生加入/移出、学生列表、班级归属校验 |
+| F3 | 知识点管理 | P0 | 知识点 CRUD（树结构，parentId 可空即顶级节点） |
 | F4 | 作业与题目管理 | P0 | 作业 CRUD、题目录入、标准答案与评分说明 |
 | F5 | 答题与批改导入 | P0 | CSV 导入答题与批改结果，含校验预览 |
 | F6 | 错误统计看板 | P0 | 按题/按知识点的错误分布 |
@@ -306,15 +308,15 @@
 
 **功能描述**：
 
-教师通过 CSV 文件批量导入学生答题和批改结果。导入前提供模板下载，导入过程中分两步：先解析校验，展示预览报告（成功多少行、失败多少行、失败原因），教师确认后再真正写入数据库。
+教师通过 CSV 文件批量导入学生答题和批改结果。导入前提供模板下载。选择文件后，**前端直接解析 CSV 并在页面上渲染表格预览**，高亮错误行并标注失败原因，教师确认后提交到服务端写入。全程不需要额外服务端往返做预览校验，服务端只在确认导入时做二次校验 + 写入。
 
 **导入流程**：
 
 ```
 1. 下载 CSV 模板（含表头说明）
-2. 上传 CSV 文件
-3. 系统解析并校验 → 展示预览报告
-4. 教师确认 → 写入数据库 → 触发 ErrorStat 重算
+2. 选择 CSV 文件 → 前端 PapaParse 解析 → 页面直接渲染表格
+3. 前端校验（本班学生列表 + 作业题目列表）→ 错误行红色高亮 + 失败原因 tooltip
+4. 教师确认 → 提交到服务端 → 服务端二次校验 + 写入 → 触发 ErrorStat 重算
 ```
 
 **校验规则**：
@@ -328,20 +330,77 @@
 | 分数格式 | 数字且在合理范围内 |
 | 判题结果 | 必须是 CORRECT / WRONG / PARTIAL 之一 |
 
-**预览报告内容**：
+**CSV 模板格式**：
 
-- 总行数、成功行数、失败行数
-- 失败行列表：行号 + 学生 + 题号 + 失败原因
-- 前 10 行成功数据预览（确认格式正确）
+答题 CSV（`submissions_template.csv`）：
+
+| 列名 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `loginName` | string | 是 | 学生登录名，如 `student03` |
+| `questionSeq` | int | 是 | 题号，如 `1`、`2`、`5` |
+| `answerText` | string | 是 | 学生作答内容 |
+
+批改 CSV（`grading_template.csv`）：
+
+| 列名 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `loginName` | string | 是 | 学生登录名 |
+| `questionSeq` | int | 是 | 题号 |
+| `score` | number | 是 | 分数（0-100） |
+| `verdict` | string | 是 | 判题结果：`CORRECT` / `WRONG` / `PARTIAL` |
+| `teacherNote` | string | 否 | 教师批改备注，如"去分母时未同时乘" |
+
+> 模板首行为表头，UTF-8 编码，逗号分隔。系统提供模板下载入口。
+
+**手工录入路径**：
+
+当教师只有少量学生答题或批改结果时，可在作业详情页直接逐条录入，无需 CSV。手工录入页面提供与 CSV 相同字段的表单（学生选择下拉框 + 题号选择 + 作答/批改内容），提交时走相同的校验逻辑。手工录入的数据与 CSV 导入的数据在数据库中无区别。
+
+**前端预览页面展示**：
+
+```
+┌─ 导入预览 · 批改 CSV ──────────────────────────────────┐
+│                                                        │
+│  成功 42 行 · 失败 3 行                                 │
+│                                                        │
+│  ┌──┬───────────┬──────┬──────┬────────┬───────────┐  │
+│  │# │loginName  │题号  │分数  │verdict │备注       │  │
+│  │1 │student01  │  1   │ 90   │CORRECT │           │  │
+│  │2 │student02  │  1   │ 45   │PARTIAL │步骤不全   │  │
+│  │3 │student99  │  1   │ 80   │WRONG   │ ← 红色背景│  │
+│  │  │            │      │      │        │ 学生不存在 │  │
+│  └──┴───────────┴──────┴──────┴────────┴───────────┘  │
+│                                                        │
+│  [全部取消]                [只导入成功行]  [全部导入]   │
+└────────────────────────────────────────────────────────┘
+```
+
+- 表格直接渲染全部数据行（前端已有数据，无分页延迟）
+- 错误行：红色背景 + 失败原因 tooltip
+- 统计栏：成功 N 行 / 失败 M 行
+- 底部按钮：全部取消 / 只导入成功行 / 全部导入
+
+**校验数据来源**：
+
+前端校验所需的数据（本班学生 loginName 列表、作业题目列表）在页面加载时已从服务端拿到，前端校验不需要额外请求。
+
+| 环节 | 前端做 | 服务端做 |
+|---|---|---|
+| 文件大小/格式拦截 | 是（选文件时立即检查） | 二次校验（防绕过） |
+| CSV 解析 | 是（PapaParse，~30KB） | 不需要 |
+| 表头/数据校验 | 是（查本班学生+作业题目） | 二次校验 |
+| 表格渲染+错误高亮 | 是 | 不需要 |
+| 写入数据库 | 否 | 是（收到确认后写入） |
 
 **边界场景**：
 
 | 场景 | 处理 |
 |---|---|
-| 文件为空 / 只有表头 | 提示"无有效数据"，不进入下一步 |
-| 部分行失败 | 展示失败明细，教师可选择"导入成功行"或"全部取消" |
-| 重复导入 | 同一学生同一题已有答题 → 提示覆盖风险，教师确认后覆盖 |
-| 超大文件 | 前端拦截文件大小，后端二次校验 |
+| 文件为空 / 只有表头 | 前端提示"无有效数据"，不渲染表格 |
+| 部分行失败 | 错误行红色高亮，教师可选择"只导入成功行"或"全部取消" |
+| 重复导入 | 前端检测到同一学生同一题已有答题 → 提示覆盖风险，教师确认后覆盖 |
+| 超大文件 | 前端选文件时拦截（>500KB 直接拒绝），不需要等上传到服务端 |
+| 前端校验被绕过 | 服务端二次校验兜底，拒绝非法数据 |
 
 ---
 
@@ -381,6 +440,46 @@
 ```
 
 **Mock 生成器（P0）**：按题目 difficulty 和关联知识点数走模板拼接，保证输出结构可解析、有依据字段。通过环境变量 `AI_PROVIDER=mock|openai|deepseek` 切换。
+
+**Mock 生成规则伪代码**：
+
+```
+function mockGenerateReviewDraft(input):
+  difficulty = input.question.difficulty        // EASY / MEDIUM / HARD
+  wrongRate = input.errorStat.wrongCount / input.errorStat.total
+  knowledgePoints = input.question.knowledgePoints
+
+  // summary：按错误率选模板
+  if wrongRate > 0.5:
+    summary = "本题错误率 {wrongRatePercent}%，主要问题在 {knowledgePointNames} 方面"
+  else if wrongRate > 0.2:
+    summary = "本题部分学生出错，错误率 {wrongRatePercent}%，集中在 {knowledgePointNames}"
+  else:
+    summary = "本题整体掌握较好，少数学生在 {knowledgePointNames} 上出错"
+
+  // errorCauses：从 teacherNote 抽样拼接
+  errorCauses = input.sampleTeacherNotes.map((note, i) => ({
+    cause: note,            // 直接用批改备注作为错因
+    count: input.errorStat.wrongCount / notes.length,  // 均分
+    evidence: "抽样批改备注"
+  }))
+
+  // explanation：按难度选模板
+  if difficulty == HARD:
+    explanation = "本题难度较大，分步讲解：\n1. 审题：{stemText}\n2. 关键步骤：{rubricText}\n3. 常见陷阱：{commonMistakeNote}\n4. 完整解法：{answerText}"
+  else:
+    explanation = "本题解法：\n1. {rubricText}\n2. 答案：{answerText}\n注意：{commonMistakeNote}"
+
+  // practiceSuggestions：按知识点生成
+  practiceSuggestions = knowledgePoints.map(kp => ({
+    text: `针对「${kp.name}」的强化练习题`,
+    rationale: `该知识点错误率 ${wrongRatePercent}%`
+  }))
+
+  return { summary, errorCauses, explanation, workedExample: "", practiceSuggestions }
+```
+
+> Mock 输出均为模板拼接，不涉及真实模型调用，保证结构稳定可解析。
 
 **AI 调用失败兜底（P0）**：任何 Provider 抛错 → 上层捕获 → `ReviewDraft.status = NEEDS_MANUAL`，记录失败原因到日志。
 
@@ -436,6 +535,17 @@
 - 已发布的草稿不能再编辑；如需修改，需先撤回（生成新草稿版本）
 - 撤回后学生端不再显示该讲评
 
+**撤回流转与边界**：
+
+撤回操作将草稿状态从 `PUBLISHED` 回退到 `DRAFT`，同时标记 `PublishedReview` 为已撤回（学生端不可见）。
+
+| 场景 | 处理 |
+|---|---|
+| 撤回时已有学生提交了订正 | 订正记录保留（不删除），但学生端不再显示讲评入口；若教师重新发布，旧订正恢复可见 |
+| 撤回时已有学生提交了疑问 | 疑问记录保留，教师仍可回复；学生端疑问入口随讲评一起隐藏 |
+| 撤回操作是否审计 | 是，记录到 `AuditLog`（action=PUBLISH_REVOKE） |
+| 撤回后重新编辑并发布 | 生成新草稿版本号；`PublishedReview` 更新为新内容，保留发布时间戳 |
+
 **边界场景**：
 
 | 场景 | 处理 |
@@ -456,6 +566,10 @@
 
 学生提交订正后，系统可触发 AI 辅助校验（可选开关），生成 `Correction.aiSuggestion` 供教师参考。AI 只给建议，不直接判定对错，最终结果由教师确认。
 
+**触发时机**：异步触发——学生提交订正后，后台异步调用 AI（若开启），教师打开订正列表时若 AI 已完成则显示建议，若未完成则显示"AI 校验中"，AI 失败则不显示建议，教师正常手动判定。
+
+**AI 辅助校验输入**：题目原文 + 标准答案 + 学生订正内容 + 评分说明。输出格式：`{ suggestion: "CORRECT" | "WRONG" | "UNCERTAIN", reason: "理由" }`。
+
 > **为什么不直接让 AI 判订正**：主观题的步骤分、思路分 AI 难以准确判断，必须由教师把关。AI 辅助只是减轻教师负担，不是替代。
 
 ---
@@ -470,7 +584,25 @@
 
 **F6 错误统计看板（P0）**：按题错误分布（柱状图）、按知识点未掌握比例（列表/柱状图）。高错误率题目突出显示，可一键跳转生成讲评草稿。
 
+**ErrorStat 生成逻辑**：
+
+ErrorStat 在批改数据写入或更新时自动重算，分两个维度聚合：
+
+1. **按题维度**：对某作业下每道题，统计 `total`（总答题人数）、`wrongCount`（verdict=WRONG）、`partialCount`（verdict=PARTIAL）。一条 `ErrorStat` 记录对应 `(assignmentId, questionId)` 组合，`knowledgePointId` 为空。
+2. **按知识点维度**：通过 `QuestionKnowledgePoint` 关联表找到该题关联的所有知识点，为每个 `(assignmentId, questionId, knowledgePointId)` 组合生成一条记录。如果一道题关联了 2 个知识点，则产生 2 条知识点维度记录，其 `total/wrongCount/partialCount` 与该题的按题维度记录相同。
+
+重算策略：每次导入批改或手工修改批改后，删除该作业下所有旧 `ErrorStat` 记录，重新全量计算写入。
+
 **F9 学生端讲评查看（P0）**：学生只能看到已发布且属于自己的讲评。展示题目、标准答案、自己的作答、教师批改、讲评正文。
+
+**学生端空状态**：
+
+| 场景 | 展示内容 |
+|---|---|
+| 无任何作业/讲评 | 插画 + "老师还没有布置作业，请耐心等待" |
+| 有作业但无错题（全部做对） | "本次作业全部正确，没有需要订正的题目" |
+| 有讲评但未提交订正 | 讲评详情页底部高亮"提交订正"入口 |
+| 已提交订正，等待教师判定 | "订正已提交，等待老师确认" |
 
 **F11 订正跟踪与回复（P0）**：教师查看作业下所有学生的订正完成情况（已提交/未提交/已通过/仍错误），可逐条查看订正内容并判定结果，回复学生疑问。
 
@@ -537,7 +669,7 @@ lib/ai/deepseek.ts   —— 预留
 | 1 | `/login` | - | P0 | 登录页 + DEMO_MODE 快速登录 |
 | 2 | `/teacher/dashboard` | 教师 | P0 | 班级列表 + 快捷入口 |
 | 3 | `/teacher/classes/[id]` | 教师 | P0 | 班级详情：学生、作业列表 |
-| 4 | `/teacher/knowledge-points` | 教研 | P0 | 知识点维护（首版扁平列表） |
+| 4 | `/teacher/knowledge-points` | 教研 | P0 | 知识点维护（树结构，支持层级展开/折叠） |
 | 5 | `/teacher/assignments/new` | 教师 | P0 | 新建作业 |
 | 6 | `/teacher/assignments/[id]` | 教师 | P0 | 作业详情：题目列表 + 状态 |
 | 7 | `/teacher/assignments/[id]/questions/[qid]` | 教师 | P0 | 题目+标准答案+评分说明编辑 |
@@ -594,10 +726,8 @@ lib/ai/deepseek.ts   —— 预留
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/assignments/[id]/import-submissions/preview` | 答题 CSV 预览校验 |
-| POST | `/api/assignments/[id]/import-submissions` | 确认导入答题 |
-| POST | `/api/assignments/[id]/import-grading/preview` | 批改 CSV 预览校验 |
-| POST | `/api/assignments/[id]/import-grading` | 确认导入批改 |
+| POST | `/api/assignments/[id]/import-submissions` | 导入答题（前端已解析校验，服务端二次校验 + 写入） |
+| POST | `/api/assignments/[id]/import-grading` | 导入批改（同上） |
 | GET | `/api/assignments/[id]/stats` | 错误分布统计 |
 
 ### 8.5 AI 草稿
@@ -682,7 +812,7 @@ lib/ai/deepseek.ts   —— 预留
 | M | 内容 | 优先级 | 交付物 |
 |---|---|---|---|
 | **M1** | 脚手架 + 数据库 + seed + 认证体系（登录/会话/登出/改密） | P0 | `npm run dev` 起来，三种角色用密码分别登录、退出 |
-| **M2** | 路由守卫 + 班级管理 / 知识点 / 作业题目 CRUD | P0 | 越权访问返回 403/404；教师只能改自己班级 |
+| **M2** | 路由守卫 + 班级管理 / 知识点 / 作业题目 CRUD | P0 | 越权访问统一返回 404；教师只能改自己班级 |
 | **M3** | CSV 导入（含校验预览） + 统计看板 | P0 | 看到错误分布；导入失败有明确提示 |
 | **M4** | AI Provider + Mock + 草稿生成（结构化存储） | P0 | 草稿列表、缺依据状态、结构化字段存储 |
 | **M5** | 草稿审核页（并排依据 + 结构化编辑） + 发布 | P0 | 教师审核流程闭环 |
@@ -703,7 +833,7 @@ lib/ai/deepseek.ts   —— 预留
 | 3 | 缺少依据的题目被标记为待教师处理，而不是编造讲解 | F7 | Q5 留空标准答案 → 状态直接 NEEDS_MANUAL，不调 AI |
 | 4 | 未经教师确认的草稿不会展示给学生 | F8 + F9 | 学生端只看到 PUBLISHED 状态的讲评，DRAFT 状态的完全不可见 |
 | 5 | 学生只能查看自己的成绩、讲评和订正记录 | F1 + F9 | 学生 A 登录后访问学生 B 的讲评 URL → 返回 404 |
-| 6 | 教师修改并发布后，学生能够订正并提交疑问 | F6 + F10 | 教师发布 → 学生刷新可见 → 提交订正 → 教师端能看到 |
+| 6 | 教师修改并发布后，学生能够订正并提交疑问 | F8 + F10 | 教师发布 → 学生刷新可见 → 提交订正 → 教师端能看到 |
 | 7 | 模型调用失败时，教师仍能手工完成讲评发布 | F7 + F8 | MOCK_AI_FAIL=true 环境下，走手工撰写路径并成功发布 |
 | 8 | 草稿修改有版本历史，可回退 | F8（P1） | 修改草稿 2 次 → 版本列表有 3 条记录 → 恢复到 v1 → 内容正确 |
 | 9 | CSV 导入有校验预览，错误行有明确提示 | F5 | 上传格式错误的 CSV → 预览页显示失败行和原因 → 可选择只导入成功行 |
@@ -712,10 +842,10 @@ lib/ai/deepseek.ts   —— 预留
 
 ## 12. 虚构数据 Seed 计划
 
-- 1 位教师（teacher01）、1 位教研（researcher01）、1 位跨班教师（teacher02）
+- 1 位教师（teacher01，带 2 个班）、1 位教研（researcher01）、1 位跨班教师（teacher02，带 1 个班）
 - 45 名学生（student01 … student45），虚构显示名"学生 1 号"…
-- 1 个班级，45 名学生全部在班
-- 8-10 个知识点（扁平列表，不做树）
+- 2 个班级：teacher01 的"初三(1)班"（30 人）和"初三(2)班"（15 人），用于演示教师多班级场景
+- 8-10 个知识点（树结构：3 个一级节点，每个下 2-3 个子节点）
 - 1 次作业 5 道题：
   - Q1-Q4 有完整标准答案 + 评分说明
   - Q5 标准答案留空 → 演示"缺依据 → NEEDS_MANUAL"
@@ -726,29 +856,140 @@ lib/ai/deepseek.ts   —— 预留
 
 | loginName | 初始密码 | 角色 | 备注 |
 |---|---|---|---|
-| `teacher01` | `Demo@2026` | 教师 | 带 1 个班 45 人 |
+| `teacher01` | `Demo@2026` | 教师 | 带 2 个班（初三1班30人 + 初三2班15人） |
 | `teacher02` | `Demo@2026` | 教师 | 演示跨班越权 |
 | `student01` … `student45` | `Demo@2026` | 学生 | 虚构显示名 |
 | `researcher01` | `Demo@2026` | 教研 | 只看知识点与聚合统计 |
 
 ---
 
-## 13. 明确不做
+## 13. 演示说明
+
+> 目的：把安全与授权设计落到可操作的流程上，避免"设计很严但演示进不去"。
+
+### 13.1 DEMO_MODE 开关
+
+生产 build 与开发默认走完整安全策略。演示时通过环境变量放宽体验，**不放宽授权**：
+
+```bash
+# .env.local
+DEMO_MODE=true        # 关掉首次强制改密 + 关掉登录失败锁定
+```
+
+`DEMO_MODE=true` 时：
+- `mustChangePassword` 不弹窗拦截
+- 登录失败不累计 `failedAttempts`
+- `/login` 页底部渲染"快速登录"按钮
+
+不影响：密码哈希、会话机制、行级授权、CSRF、审计。
+
+构建期保护：`next build` 时若 `NODE_ENV=production` 且 `DEMO_MODE=true` → 直接抛错。
+
+### 13.2 登录页与快速登录
+
+```
+┌───────────────────────────────┐
+│   登录 · 数学作业讲评助手      │
+│                               │
+│  账号 [________]              │
+│  密码 [________]              │
+│  [ 登 录 ]                    │
+│                               │
+│  ─── 开发模式快速登录 ───     │  ← 仅 DEMO_MODE=true
+│  [ 张老师 ] [ 学生 3 号 ]      │
+│  [ 教研   ] [ 教师 2 号 ]      │
+└───────────────────────────────┘
+```
+
+点击 → `POST /api/auth/login` 带对应 loginName + `Demo@2026`。
+
+### 13.3 会话与登出
+
+- Cookie 名：`sid`；值：`Session.id`（不透明随机串）
+- `httpOnly / SameSite=Lax / Secure(生产) / Path=/ / Max-Age=7d`
+- 顶栏"退出登录" → 撤销当前 session → 清 cookie → 跳 `/login`
+
+### 13.4 演示脚本
+
+1. 开 3 个浏览器/隐身窗口：A=Chrome 常规、B=Chrome 隐身、C=Firefox
+2. A 点"以张老师登录" → 进 `/teacher/dashboard`（看到 2 个班级）
+3. B 点"以学生3号登录" → 只能看到自己
+4. C 点"以教研登录" → 只能看知识点树 + 跨班聚合
+5. A：进入"初三(1)班" → 新建作业 → 录题 Q1-Q5 → 只给 Q1-Q4 填标准答案与评分说明（Q5 故意留空）
+6. A：导入 45 份答题 CSV → 导入批改 CSV → 打开统计看板
+7. A：点"为 Q1-Q5 生成讲评草稿" → Q1-Q4 进入 DRAFT，Q5 直接 `NEEDS_MANUAL`
+8. A：打开 Q5 草稿 → 演示"缺依据不调 AI" → 手工撰写 → 发布
+9. A：打开 Q1 草稿 → 并排展示依据/草稿 → 编辑 → 保存 → 查看版本历史 → 恢复到 v1 → 发布
+10. B：学生刷新 → 看到 Q1、Q5 讲评 → 提交订正 → 提疑问
+11. A：查看订正完成情况 → 回复疑问
+12. 切 `MOCK_AI_FAIL=true` 重启 A → 演示模型不可用时手工撰写照常走
+13. B 手动访问 `/student/reviews/[id 属于他人]` → 404
+14. C 尝试打开 `/student/...` → 404
+
+### 13.5 常见卡点与工具
+
+| 卡点 | 处理 |
+|---|---|
+| 忘了改后的密码 | `npm run reset-password -- <loginName> [新密码]`，CLI 直连数据库 |
+| 数据库脏了 | `npm run db:reset` = `prisma migrate reset --force && tsx prisma/seed.ts` |
+| 会话不失效 | `npm run revoke-sessions -- <loginName>` 一键踢出 |
+| Cookie 域踩坑 | 统一使用 `http://localhost:3000`，不用 `127.0.0.1` |
+| CSRF 与登录死锁 | 访问 `/login` 时 GET 返回匿名 CSRF token 塞进 cookie + form 隐藏字段 |
+
+---
+
+## 14. 目录结构
+
+```
+D:/ai/
+  PLAN-v2.md                     ← 本文件
+  README.md
+  package.json
+  prisma/
+    schema.prisma
+    seed.ts                      ← 虚构数据
+  src/
+    app/
+      layout.tsx
+      page.tsx
+      (auth)/login/page.tsx
+      teacher/...                ← 页面清单第 2-14 项
+      student/...                ← 第 15-16 项
+      api/...                    ← API 路由
+    components/
+      DraftEditor.tsx            ← 依据+草稿并排
+      ErrorStatChart.tsx
+      KnowledgePointTree.tsx
+    lib/
+      db.ts                      ← Prisma client 单例
+      auth.ts                    ← session 与角色守卫
+      ai/
+        provider.ts
+        mock.ts
+      csv.ts
+      types.ts
+  .env.example
+```
+
+---
+
+## 15. 明确不做
 
 - 不接入真实学校教务系统和未成年人个人数据
 - 不做人脸识别、课堂监控和行为评分
 - 不让 AI 自动评分主观题或决定成绩/订正结果
 - 不建设直播、题库商城和完整在线考试平台
-- ~~首版不做知识点树~~（v2.1 调整：知识点树已实现，扁平为其特例）
+- ~~首版不做知识点树~~（v2.1 调整：知识点树已实现，扁平为其特例，v2.2 统一为树）
 - 首版不做教研的公共模板审核
 
 ---
 
-## 14. 技术选型
+## 16. 技术选型
 
 - **Next.js 14 App Router** + TypeScript
 - **Prisma** + **SQLite**（`dev.db`，无需外部服务）
 - **Tailwind CSS** + shadcn/ui
 - **Recharts** 错误分布图表
+- **PapaParse** 前端 CSV 解析（~30KB，无需服务端往返）
 - **zod** 校验
 - **Auth**：bcrypt + 服务端 Session 表 + httpOnly cookie + CSRF
